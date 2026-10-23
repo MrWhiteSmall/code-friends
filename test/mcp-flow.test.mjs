@@ -1,0 +1,133 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { fork } from 'node:child_process';
+import { EventEmitter, once } from 'node:events';
+import { createServer } from 'node:http';
+import { mkdtemp, mkdir, cp, symlink, writeFile, rm, readFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, delimiter } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { WebSocketServer } from 'ws';
+
+test('real bridge forwards an MCP card and returns the clicked decision once despite an expired Telegram acknowledgement', { timeout: 15000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'cf-flow-'));
+  const socketPath = join(root, 'rpc.sock');
+  const server = createServer();
+  const websocket = new WebSocketServer({ server });
+  const activity = new EventEmitter();
+  const calls = [];
+  const polls = [];
+  const responses = [];
+  let child;
+  let exited = false;
+  let stderr = '';
+  t.after(async () => {
+    if (child && !exited) {
+      const stopped = once(child, 'exit');
+      child.kill('SIGTERM');
+      await stopped;
+    }
+    for (const socket of websocket.clients) socket.terminate();
+    await new Promise(resolve => websocket.close(resolve));
+    await new Promise(resolve => server.close(resolve));
+    await rm(root, { recursive: true, force: true });
+  });
+  async function until(predicate) {
+    while (!predicate()) {
+      assert.equal(exited, false, `bridge exited: ${stderr}`);
+      await once(activity, 'change', { signal: t.signal });
+    }
+  }
+  await cp(new URL('../src/', import.meta.url), join(root, 'src'), { recursive: true });
+  await symlink(fileURLToPath(new URL('../node_modules', import.meta.url)), join(root, 'node_modules'), 'dir');
+  await mkdir(join(root, '.local'));
+  await mkdir(join(root, 'bin'));
+  await writeFile(join(root, '.local', 'state.json'), JSON.stringify({ owner: { userId: 34, chatId: 12 },
+    addresses: { 'task-a': { code: 'c1' } }, replies: {}, offset: 0 }));
+  await writeFile(join(root, 'bin', 'codex'), `#!${process.execPath}\nconsole.log(${JSON.stringify(JSON.stringify({ status: 'running', socketPath }))});\n`, { mode: 0o700 });
+  await writeFile(join(root, 'fake-telegram.mjs'), `
+    let next = 0;
+    const pending = new Map();
+    process.on('message', message => {
+      const resolve = pending.get(message.id);
+      if (!resolve) return;
+      pending.delete(message.id);
+      resolve({ json: async () => message.payload });
+    });
+    globalThis.fetch = async (url, options) => new Promise(resolve => {
+      const id = ++next;
+      pending.set(id, resolve);
+      process.send({ id, method: new URL(url).pathname.split('/').at(-1), data: JSON.parse(options.body) });
+    });
+  `);
+  websocket.on('connection', socket => {
+    socket.on('message', bytes => {
+      const message = JSON.parse(bytes.toString());
+      const reply = result => socket.send(JSON.stringify({ id: message.id, result }));
+      if (message.method === 'initialize') reply({});
+      if (message.method === 'thread/loaded/list') reply({ data: ['task-a'] });
+      if (message.method === 'thread/read') reply({ thread: { id: 'task-a', name: 'MCP fixture', status: { type: 'active' } } });
+      if (message.method === 'thread/resume') {
+        socket.send(JSON.stringify({ id: 'approval-1', method: 'mcpServer/elicitation/request', params: {
+          threadId: 'task-a', turnId: 'turn-a', serverName: 'cua_repl', mode: 'form',
+          message: 'Allow the cua_repl MCP server to run tool "js"?',
+          requestedSchema: { type: 'object', properties: {} },
+          _meta: { codex_approval_kind: 'mcp_tool_call', persist: ['session', 'always'],
+            tool_params: { code: 'read current state' } },
+        } }));
+        reply({});
+      }
+      if (!message.method && message.id === 'approval-1') {
+        responses.push(message);
+        activity.emit('change');
+      }
+    });
+  });
+  server.listen(socketPath);
+  await once(server, 'listening');
+  child = fork(join(root, 'src', 'main.mjs'), [], {
+    execArgv: ['--import', join(root, 'fake-telegram.mjs')],
+    env: { ...process.env, TELEGRAM_TOKEN: 'local-test', PATH: join(root, 'bin') + delimiter + process.env.PATH },
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+  });
+  child.on('exit', () => { exited = true; activity.emit('change'); });
+  child.stdout.resume();
+  child.stderr.on('data', bytes => { stderr += bytes; });
+  child.on('message', request => {
+    calls.push(request);
+    let result = true;
+    if (request.method === 'getMe') result = { username: 'TestBot' };
+    if (request.method === 'getUpdates') {
+      polls.push(request);
+      activity.emit('change');
+      return;
+    }
+    if (request.method === 'sendMessage') result = { ...request.data, message_id: calls.length };
+    const payload = request.method === 'answerCallbackQuery'
+      ? { ok: false, error_code: 400, description: 'query is too old and response timeout expired' }
+      : { ok: true, result };
+    child.send({ id: request.id, payload });
+    activity.emit('change');
+  });
+  await until(() => polls.length);
+  const card = calls.find(x => x.method === 'sendMessage' && x.data.text.includes('等待 MCP 工具授权'));
+  assert.ok(card);
+  assert.match(card.data.text, /read current state/);
+  const buttons = card.data.reply_markup.inline_keyboard.flat();
+  assert.equal(buttons.length, 4);
+  assert.ok(buttons.every(x => Buffer.byteLength(x.callback_data) <= 64));
+  const session = buttons.find(x => x.callback_data.endsWith(':session'));
+  assert.ok(session);
+  assert.equal(responses.length, 0, 'sending a card must not approve it');
+  const runtime = JSON.parse(await readFile(join(root, '.local', 'runtime.json'), 'utf8'));
+  assert.equal(runtime.lastRequestDeliveredToTelegram.interactive, true);
+  const click = { update_id: 1, callback_query: { id: 'click-1', from: { id: 34 }, data: session.callback_data,
+    message: { message_id: 99, chat: { id: 12, type: 'private' } } } };
+  child.send({ id: polls.shift().id, payload: { ok: true, result: [click] } });
+  await until(() => responses.length && polls.length);
+  assert.deepEqual(responses, [{ id: 'approval-1', result: { action: 'accept', content: {}, _meta: { persist: 'session' } } }]);
+  assert.ok(calls.some(x => x.method === 'editMessageReplyMarkup' && x.data.reply_markup.inline_keyboard.length === 0));
+  child.send({ id: polls.shift().id, payload: { ok: true, result: [{ ...click, update_id: 2 }] } });
+  await until(() => calls.some(x => x.method === 'sendMessage' && x.data.text.includes('此请求已经处理或过期')));
+  assert.equal(responses.length, 1, 'a duplicate click must not submit the decision again');
+});

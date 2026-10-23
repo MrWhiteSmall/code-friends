@@ -21,7 +21,7 @@ function display(status) {
     }
     if (runtime.lastRequestDeliveredToTelegram) {
       const delivery = runtime.lastRequestDeliveredToTelegram;
-      console.log(`Telegram 最近已接收请求卡片：${delivery.task}，消息 ${delivery.messageId}（${delivery.at}）`);
+      console.log(`Telegram 最近已接收${delivery.interactive === false ? '请求通知（无按钮）' : '请求卡片'}：${delivery.task}，消息 ${delivery.messageId}（${delivery.at}）`);
     }
     if (runtime.lastRequestDeliveryError) {
       const failure = runtime.lastRequestDeliveryError;

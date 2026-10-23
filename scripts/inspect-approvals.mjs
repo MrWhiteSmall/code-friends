@@ -3,6 +3,7 @@ import { CodexRPC } from '../src/rpc.mjs';
 import { loadThreadSnapshot, missingThread } from '../src/threads.mjs';
 import { Addresses } from '../src/addresses.mjs';
 import { redact } from '../src/telegram.mjs';
+import { mcpToolApproval } from '../src/mcp-approval.mjs';
 
 // Read/rejoin existing sessions only. Never answer, approve, or submit a turn.
 const state = JSON.parse(readFileSync(new URL('../.local/state.json', import.meta.url), 'utf8'));
@@ -18,6 +19,7 @@ rpc.on('request', request => {
     parameterNames: Object.keys(p), availableDecisions: p.availableDecisions,
     permissionKeys: p.permissions ? Object.keys(p.permissions) : undefined,
     serverName: p.serverName, mode: p.mode,
+    mcpApprovalChoices: mcpToolApproval(request)?.decisions.map(x => x.value),
     questions: p.questions?.map(q => ({ id: q.id, isSecret: q.isSecret,
       options: q.options?.map(o => o.label) })),
   });

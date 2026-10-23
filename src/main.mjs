@@ -9,6 +9,7 @@ import { Addresses } from './addresses.mjs';
 import { BOT_COMMANDS, registerCommands } from './commands.mjs';
 import { deliverInput, deliveryDescription } from './delivery.mjs';
 import { loadThreadSnapshot, missingThread } from './threads.mjs';
+import { mcpToolApproval, mcpApprovalResult } from './mcp-approval.mjs';
 import { authorized, matchingCode, parsePairCommand, title, statusText, PendingRequests, approvalResult } from './core.mjs';
 
 const project = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -138,9 +139,10 @@ async function showRequest(key) {
   try {
     const message = await renderRequest(key);
     if (message?.message_id) {
-      const delivery = { task, method: request.method, messageId: message.message_id, at: new Date().toISOString() };
+      const interactive = Boolean(message.reply_markup?.inline_keyboard?.some(row => row.some(button => button.callback_data)));
+      const delivery = { task, method: request.method, messageId: message.message_id, interactive, at: new Date().toISOString() };
       updateRuntime({ lastRequestDeliveredToTelegram: delivery });
-      console.log(`${delivery.at} Telegram 已接收请求卡片 ${JSON.stringify(delivery)}`);
+      console.log(`${delivery.at} Telegram 已接收${interactive ? '交互请求卡片' : '请求通知'} ${JSON.stringify(delivery)}`);
     }
     return message;
   } catch (error) {
@@ -155,6 +157,13 @@ async function renderRequest(key) {
   const { method, params: p } = entry.request;
   const heading = `好友：${friend(p.threadId)}`;
   const target = { threadId: p.threadId, requestKey: key };
+  if (method === 'mcpServer/elicitation/request') {
+    const approval = mcpToolApproval(entry.request);
+    if (!approval) return tell(`${heading}\nMCP 服务 ${p.serverName} 需要填写表单、登录或其他交互，请在电脑上处理。`, undefined, { threadId: p.threadId });
+    return tell(`${heading}\n⏳ 等待 MCP 工具授权\n\n${approval.details}`, {
+      reply_markup: { inline_keyboard: approval.decisions.map(({ value, text }) => [{ text, callback_data: `m:${key}:${value}` }]) },
+    }, target);
+  }
   if (method === 'item/tool/requestUserInput') {
     const question = p.questions[entry.questionIndex];
     if (!question) return;
@@ -273,7 +282,8 @@ async function handle(update) {
     return tell('有一条超过五分钟的消息，未执行。请重新发送，以免把旧指令送进当前任务。');
   }
   if (callback) {
-    await telegram.call('answerCallbackQuery', { callback_query_id: callback.id });
+    // A delayed Telegram UI acknowledgement must not discard a still-live approval.
+    await telegram.call('answerCallbackQuery', { callback_query_id: callback.id }).catch(logError);
     await refresh();
     const [kind, key, value, option] = (callback.data || '').split(':');
     if (kind === 'open') {
@@ -283,6 +293,14 @@ async function handle(update) {
     }
     const entry = pending.entries.get(key);
     if (!entry) throw new Error('此请求已经处理或过期，请 /pending 查看当前请求。');
+    if (kind === 'm') {
+      const result = mcpApprovalResult(entry.request, value);
+      rpc.respond(entry.request.id, result);
+      pending.take(key);
+      await telegram.call('editMessageReplyMarkup', { chat_id: chat.id, message_id: callback.message.message_id, reply_markup: { inline_keyboard: [] } }).catch(logError);
+      const decision = { accept: '允许本次', session: '允许该工具用于本会话', decline: '拒绝', cancel: '取消' }[value];
+      return tell(`已向「${friend(entry.request.params.threadId)}」提交：${decision}。`);
+    }
     if (kind === 'a') {
       const result = approvalResult(entry.request, value);
       pending.take(key);

@@ -27,7 +27,7 @@ REA 工具是否要求确认取决于其 read-only/destructive/open-world 注解
 
 ## 对 Telegram 桥接的影响
 
-桥接已支持命令审批、文件审批、权限审批和 `item/tool/requestUserInput`，但尚未实现 `mcpServer/elicitation/request` 的表单/审批响应。其兜底分支只发送“需要在电脑上处理：mcpServer/elicitation/request”，没有授权按钮。
+检查时，桥接已支持命令审批、文件审批、权限审批和 `item/tool/requestUserInput`，但尚未实现 `mcpServer/elicitation/request` 的表单/审批响应。其兜底分支只发送“需要在电脑上处理：mcpServer/elicitation/request”，没有授权按钮。
 
 日志中的直接证据（均为北京时间）：
 
@@ -36,7 +36,11 @@ REA 工具是否要求确认取决于其 read-only/destructive/open-world 注解
 
 这里“Telegram 已接收请求卡片”的日志只证明 `sendMessage` 成功，包含了没有按钮的兜底通知，不能据此认定手机端已经可以完成该审批。
 
-后续兼容应识别 MCP 工具审批元数据，显示工具名、参数和准确授权范围，再按 MCP elicitation 的响应格式返回。不能把 MCP `Allow` 简单当作命令审批的 `{decision:"accept"}`；通用 MCP 表单、URL 登录或用户验证请求也不能全部当作简单 yes/no。此次检查只增加诊断脚本与报告，未改变运行中桥接的审批行为。
+### 修复补记
+
+随后已在 `src/mcp-approval.mjs` 实现带 `_meta.codex_approval_kind="mcp_tool_call"` 的空表单授权：显示服务、工具和原始参数，支持允许本次、服务器明确提供的会话授权、拒绝和取消。响应使用 `action/content/_meta`；会话授权只发送 `{persist:"session"}`，不回传请求中提供的永久授权元数据。通用表单、URL 登录和用户验证仍在电脑端处理。
+
+日志现在区分带按钮的交互请求卡片与无按钮的请求通知。Telegram 按钮回调的界面确认超时，不再阻止仍然有效的审批提交。新增完整进程测试验证：卡片发送前不自动批准，点击后返回正确协议，重复点击不会重复提交。
 
 ## 文件和复查
 
