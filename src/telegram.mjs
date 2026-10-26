@@ -31,12 +31,14 @@ export class Telegram {
     }
   }
 
-  send(chatId, text, extra = {}) {
+  send(chatId, text, extra = {}, current = () => true) {
     const run = async () => {
       const chunks = splitText(redact(text, this.token));
       let last;
       for (let i = 0; i < chunks.length; i++) {
         for (let retry = 0; ; retry++) {
+          // A request may resolve while it waits behind another send or a 429.
+          if (!current()) return;
           try {
             last = await this.call('sendMessage', {
               chat_id: chatId, text: chunks[i],

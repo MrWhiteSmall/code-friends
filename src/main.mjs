@@ -10,6 +10,7 @@ import { BOT_COMMANDS, registerCommands } from './commands.mjs';
 import { deliverInput, deliveryDescription } from './delivery.mjs';
 import { loadThreadSnapshot, missingThread } from './threads.mjs';
 import { mcpToolApproval, mcpApprovalResult } from './mcp-approval.mjs';
+import { RequestNotifications } from './request-notifications.mjs';
 import { authorized, matchingCode, parsePairCommand, title, statusText, PendingRequests, approvalResult } from './core.mjs';
 
 const project = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -53,10 +54,10 @@ const pairExpiry = Date.now() + 30 * 60 * 1000;
 let running = true;
 let refreshing;
 
-async function tell(text, extra, target) {
+async function tell(text, extra, target, current) {
   if (!state.data.owner) return;
-  const message = await telegram.send(state.data.owner.chatId, text, extra);
-  if (target) state.reply(message.message_id, target);
+  const message = await telegram.send(state.data.owner.chatId, text, extra, current);
+  if (target && message) state.reply(message.message_id, target);
   return message;
 }
 
@@ -131,36 +132,34 @@ async function sendInput(id, text, inputId) {
   await tell(`「${friend(id)}」\n${deliveryDescription(result.status)}\n审批请使用对应审批卡片的按钮。`, undefined, { threadId: id });
 }
 
-async function showRequest(key) {
-  const entry = pending.entries.get(key);
-  if (!entry) return;
-  const request = entry.request;
-  const task = addresses.display(request.params.threadId) || request.params.threadId;
-  try {
-    const message = await renderRequest(key);
-    if (message?.message_id) {
-      const interactive = Boolean(message.reply_markup?.inline_keyboard?.some(row => row.some(button => button.callback_data)));
-      const delivery = { task, method: request.method, messageId: message.message_id, interactive, at: new Date().toISOString() };
-      updateRuntime({ lastRequestDeliveredToTelegram: delivery });
-      console.log(`${delivery.at} Telegram 已接收${interactive ? '交互请求卡片' : '请求通知'} ${JSON.stringify(delivery)}`);
-    }
-    return message;
-  } catch (error) {
+const notifications = new RequestNotifications(pending, {
+  render: renderRequest,
+  logError,
+  delivered(request, message) {
+    const task = addresses.display(request.params.threadId) || request.params.threadId;
+    const interactive = Boolean(message.reply_markup?.inline_keyboard?.some(row => row.some(button => button.callback_data)));
+    const delivery = { task, method: request.method, messageId: message.message_id, interactive, at: new Date().toISOString() };
+    updateRuntime({ lastRequestDeliveredToTelegram: delivery });
+    console.log(`${delivery.at} Telegram 已接收${interactive ? '交互请求卡片' : '请求通知'} ${JSON.stringify(delivery)}`);
+  },
+  failed(request, error) {
+    const task = addresses.display(request.params.threadId) || request.params.threadId;
     updateRuntime({ lastRequestDeliveryError: { task, method: request.method, message: redact(error.message, token), at: new Date().toISOString() } });
-    throw error;
-  }
-}
+  },
+});
+const showRequest = (key, options) => notifications.show(key, options);
 
-async function renderRequest(key) {
+async function renderRequest(key, current) {
   const entry = pending.entries.get(key);
   if (!entry) return;
   const { method, params: p } = entry.request;
   const heading = `好友：${friend(p.threadId)}`;
   const target = { threadId: p.threadId, requestKey: key };
+  const send = (text, extra, target) => tell(text, extra, target, current);
   if (method === 'mcpServer/elicitation/request') {
     const approval = mcpToolApproval(entry.request);
-    if (!approval) return tell(`${heading}\nMCP 服务 ${p.serverName} 需要填写表单、登录或其他交互，请在电脑上处理。`, undefined, { threadId: p.threadId });
-    return tell(`${heading}\n⏳ 等待 MCP 工具授权\n\n${approval.details}`, {
+    if (!approval) return send(`${heading}\nMCP 服务 ${p.serverName} 需要填写表单、登录或其他交互，请在电脑上处理。`, undefined, { threadId: p.threadId });
+    return send(`${heading}\n⏳ 等待 MCP 工具授权\n\n${approval.details}`, {
       reply_markup: { inline_keyboard: approval.decisions.map(({ value, text }) => [{ text, callback_data: `m:${key}:${value}` }]) },
     }, target);
   }
@@ -168,10 +167,10 @@ async function renderRequest(key) {
     const question = p.questions[entry.questionIndex];
     if (!question) return;
     if (question.isSecret) {
-      return tell(`${heading}\n需要输入私密信息，请在电脑上回答。`, undefined, { threadId: p.threadId });
+      return send(`${heading}\n需要输入私密信息，请在电脑上回答。`, undefined, { threadId: p.threadId });
     }
     const options = question.options || [];
-    return tell(`${heading}\n问题 ${entry.questionIndex + 1}/${p.questions.length}：${question.question}\n\n${options.map((o, i) => `${i + 1}. ${o.label}\n${o.description}`).join('\n\n')}\n\n也可以使用 Telegram 的“回复”回答这条消息。`, {
+    return send(`${heading}\n问题 ${entry.questionIndex + 1}/${p.questions.length}：${question.question}\n\n${options.map((o, i) => `${i + 1}. ${o.label}\n${o.description}`).join('\n\n')}\n\n也可以使用 Telegram 的“回复”回答这条消息。`, {
       reply_markup: { inline_keyboard: options.map((o, i) => [{ text: o.label, callback_data: `q:${key}:${entry.questionIndex}:${i}` }]) },
     }, { ...target, questionIndex: entry.questionIndex });
   }
@@ -183,19 +182,19 @@ async function renderRequest(key) {
     if (method === 'item/fileChange/requestApproval') {
       const page = await rpc.call('thread/items/list', { threadId: p.threadId, turnId: p.turnId, sortDirection: 'desc', limit: 100 });
       const item = page.data.find(x => x.item.id === p.itemId)?.item;
-      if (!item) return tell(`${heading}\n有文件修改审批，但无法取得修改详情。请在电脑上处理。`, undefined, { threadId: p.threadId });
+      if (!item) return send(`${heading}\n有文件修改审批，但无法取得修改详情。请在电脑上处理。`, undefined, { threadId: p.threadId });
       detail = (item.changes || []).map(c => `${c.path}\n${c.diff}`).join('\n\n');
     }
-    if (!detail && !p.reason) return tell(`${heading}\n审批详情不可用，请在电脑上处理。`, undefined, { threadId: p.threadId });
+    if (!detail && !p.reason) return send(`${heading}\n审批详情不可用，请在电脑上处理。`, undefined, { threadId: p.threadId });
     const allowed = p.availableDecisions || ['accept', 'decline', 'cancel'];
     const buttons = [['accept', method === 'item/permissions/requestApproval' ? '授权当前轮次' : '批准一次'], ['decline', '拒绝']]
       .filter(([value]) => allowed.includes(value))
       .map(([value, text]) => ({ text, callback_data: `a:${key}:${value}` }));
-    return tell(`${heading}\n⏳ 等待你的批准\n${p.reason || ''}\n${p.cwd ? `目录：${p.cwd}\n` : ''}${detail}`, {
+    return send(`${heading}\n⏳ 等待你的批准\n${p.reason || ''}\n${p.cwd ? `目录：${p.cwd}\n` : ''}${detail}`, {
       reply_markup: { inline_keyboard: [buttons] },
     }, target);
   }
-  return tell(`${heading}\n需要在电脑上处理：${method}`, undefined, { threadId: p.threadId });
+  return send(`${heading}\n需要在电脑上处理：${method}`, undefined, { threadId: p.threadId });
 }
 
 async function answerQuestion(key, answer, questionIndex) {
@@ -322,7 +321,7 @@ async function handle(update) {
   if (command === 'pending') {
     await refresh();
     if (!pending.entries.size) return tell('当前连接没有等待中的请求。');
-    for (const key of pending.entries.keys()) await showRequest(key);
+    for (const key of pending.entries.keys()) await showRequest(key, { force: true });
     return;
   }
   if (command === 'start' || command === 'help') {
@@ -386,7 +385,10 @@ async function main() {
   if (!state.data.owner) console.log(`请在三十分钟内，向机器人私聊发送：/pair ${pairCode}`);
   else await tell('Codex Friends 已上线。/tasks 查看会话名字；现在支持 @c1 继续 和 /alias c1 登录。').catch(logError);
   updateRuntime({ status: 'running' });
-  const timer = setInterval(() => refresh().catch(logError), 15000);
+  const timer = setInterval(() => {
+    refresh().catch(logError);
+    notifications.retry().catch(logError);
+  }, 15000);
   let failures = 0;
   try {
     while (running) {
@@ -401,6 +403,7 @@ async function main() {
           try { await handle(update); }
           catch (error) { logError(error); await tell(redact(error.message, token)).catch(logError); }
         }
+        notifications.retry().catch(logError);
       } catch (error) {
         updateRuntime({ telegramConnected: false });
         logError(error);

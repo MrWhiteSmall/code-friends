@@ -9,7 +9,7 @@ import { join, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 
-test('real bridge forwards an MCP card and returns the clicked decision once despite an expired Telegram acknowledgement', { timeout: 15000 }, async t => {
+for (const outage of [false, true]) test(`real bridge ${outage ? 'recovers a failed approval notification after a Telegram outage' : 'forwards an MCP card'} and submits each decision only once`, { timeout: 15000 }, async t => {
   const root = await mkdtemp(join(tmpdir(), 'cf-flow-'));
   const socketPath = join(root, 'rpc.sock');
   const server = createServer();
@@ -21,6 +21,9 @@ test('real bridge forwards an MCP card and returns the clicked decision once des
   let child;
   let exited = false;
   let stderr = '';
+  let stdout = '';
+  let failedCard = false;
+  let pollCount = 0;
   t.after(async () => {
     if (child && !exited) {
       const stopped = once(child, 'exit');
@@ -91,13 +94,27 @@ test('real bridge forwards an MCP card and returns the clicked decision once des
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   });
   child.on('exit', () => { exited = true; activity.emit('change'); });
-  child.stdout.resume();
+  child.stdout.on('data', bytes => { stdout += bytes; activity.emit('change'); });
   child.stderr.on('data', bytes => { stderr += bytes; });
   child.on('message', request => {
     calls.push(request);
     let result = true;
     if (request.method === 'getMe') result = { username: 'TestBot' };
+    if (request.method === 'sendMessage' && outage && !failedCard && request.data.text.includes('等待 MCP 工具授权')) {
+      failedCard = true;
+      child.send({ id: request.id, payload: { ok: false, error_code: 502, description: 'Bad Gateway' } });
+      activity.emit('change');
+      return;
+    }
     if (request.method === 'getUpdates') {
+      pollCount++;
+      if (outage && pollCount <= 2) {
+        child.send({ id: request.id, payload: pollCount === 1
+          ? { ok: false, error_code: 502, description: 'Bad Gateway' }
+          : { ok: true, result: [] } });
+        activity.emit('change');
+        return;
+      }
       polls.push(request);
       activity.emit('change');
       return;
@@ -109,8 +126,11 @@ test('real bridge forwards an MCP card and returns the clicked decision once des
     child.send({ id: request.id, payload });
     activity.emit('change');
   });
-  await until(() => polls.length);
-  const card = calls.find(x => x.method === 'sendMessage' && x.data.text.includes('等待 MCP 工具授权'));
+  await until(() => polls.length && stdout.includes('Telegram 已接收交互请求卡片'));
+  const cards = calls.filter(x => x.method === 'sendMessage' && x.data.text.includes('等待 MCP 工具授权'));
+  assert.equal(cards.length, outage ? 2 : 1);
+  if (outage) assert.deepEqual(cards[0].data.reply_markup, cards[1].data.reply_markup, 'retry keeps the same single-use request key');
+  const card = cards.at(-1);
   assert.ok(card);
   assert.match(card.data.text, /read current state/);
   const buttons = card.data.reply_markup.inline_keyboard.flat();
