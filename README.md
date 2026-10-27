@@ -43,6 +43,24 @@ Telegram 连续两次网络错误或 5xx 后，后续请求自动切换到系统
 
 如果刚刚编辑 `.zshrc`，重新打开终端，或执行 `source ~/.zshrc` 后启动。支持 Node 原生环境代理：可通过 `HTTPS_PROXY` / `https_proxy` 使用已有网络代理。
 
+## Clash 日本节点自动切换
+
+使用 Clash Verge Rev / Mihomo 本机控制接口，配置路径默认取 `~/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml`。控制密钥每次从原配置读取，不复制、不输出，控制请求通过 Node 原生 HTTP 直连回环接口，避免被 VPN 代理绕走。
+
+```sh
+npm run vpn -- status   # 当前节点、是否启用、最近探测结果
+npm run vpn -- check    # 只检测当前节点到 Telegram，不切换
+npm run vpn -- enable   # 启用自动巡检，并保存原选择
+npm run vpn -- disable  # 停用，保留当前节点
+npm run vpn -- restore  # 停用，并恢复启用前的选择
+```
+
+启用后由桥接进程每 45 秒检测 `🚀节点选择` 实际使用的日本节点。用 Mihomo 官方 `/proxies/{name}/delay` 接口检测 `https://api.telegram.org`，连续两次失败后，每批最多三个节点，寻找组内可用的具体日本节点并通过官方选择接口替换；健康时不切换，切换冷却三分钟，全部不可用时保留原选择。探测只说明该时刻 Telegram 公共 HTTPS 地址可达，不保证所有 Telegram 请求或手机端连接都成功。
+
+当前 Telegram 和其他规则共用 `🚀节点选择`，因此切换也会影响使用该组的其他新连接。不会改订阅、路由规则或系统代理。选好节点后，只关闭该组下已识别的 `telegram.org` / `cdn-telegram.org` 域名连接，使其重连；其他既有连接保持运行。用 IP 或其他域名建立的 Telegram 连接不在清理范围内。切换前再次核对选择，避免覆盖探测期间的手动修改；手动选非日本节点时自动暂停。CLI 的 `disable` 可以离线停用巡检，`restore` 需要 Clash 控制接口可用。
+
+首次配置默认不启用；`enable` 后在桥接运行期间持续巡检，包括 Telegram 尚未成功连接的启动阶段。已运行的旧版本需要 `npm run restart` 加载此功能。设置与结果保存在被 Git 忽略的 `.local/clash-guard.json`、`.local/clash-status.json`，可在 `npm run status` 中查看最新健康状态。
+
 ## 手机使用
 
 在机器人的私聊中输入 `/`，Telegram 会显示已注册的指令与中文说明；也可点击输入框旁的菜单按钮。菜单在首次配对和程序启动时自动注册，仅显示在已配对的私聊中。

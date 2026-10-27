@@ -11,6 +11,7 @@ import { deliverInput, deliveryDescription } from './delivery.mjs';
 import { loadThreadSnapshot, missingThread } from './threads.mjs';
 import { mcpToolApproval, mcpApprovalResult } from './mcp-approval.mjs';
 import { RequestNotifications } from './request-notifications.mjs';
+import { createClashWatch } from './clash-watch.mjs';
 import { authorized, matchingCode, parsePairCommand, title, statusText, PendingRequests, approvalResult } from './core.mjs';
 
 const project = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -449,6 +450,22 @@ rpc.on('disconnect', error => {
   updateRuntime({ codexConnected: false, loadedTasks: 0 });
   logError(error);
 });
+let lastClashStatus;
+const clashWatch = createClashWatch(project, status => {
+  updateRuntime({ clashGuard: status });
+  if (status.status !== lastClashStatus || status.status === 'switched') {
+    console.log(`${status.at} Clash 自动巡检 ${JSON.stringify(status)}`);
+    lastClashStatus = status.status;
+  }
+});
+let clashTimer;
+if (!checking) {
+  // Start before Telegram getMe: VPN recovery must also work during startup.
+  clashTimer = setInterval(() => clashWatch.tick().catch(logError), 15000);
+  process.on('exit', () => clearInterval(clashTimer));
+  clashWatch.tick().catch(logError);
+}
 main().catch(error => {
+  clearInterval(clashTimer);
   logError(error); updateRuntime({ status: 'failed' }); rpc.close(); process.exitCode = 1;
 });

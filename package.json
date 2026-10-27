@@ -10,6 +10,7 @@
     "stop": "node scripts/service.mjs stop",
     "status": "node scripts/service.mjs status",
     "restart": "node scripts/service.mjs restart",
+    "vpn": "node scripts/vpn.mjs",
     "foreground": "zsh scripts/run.zsh",
     "check": "node --use-env-proxy src/main.mjs --check",
     "test": "node --test"
