@@ -13,6 +13,8 @@ function display(status) {
   if (status.running && runtime) {
     console.log(`Codex 连接：${runtime.codexConnected ? '已连接' : '未连接'}；当前会话：${runtime.loadedTasks || 0}`);
     console.log(`Telegram 连接：${runtime.telegramConnected ? '已连接' : '未连接'}`);
+    console.log(`Telegram 通道：${runtime.telegramTransport === 'curl' ? 'curl 独立连接兜底' : 'Node fetch'}`);
+    if (runtime.lastTelegramTransportChange) console.log(`最近通道切换：${runtime.lastTelegramTransportChange.reason}（${runtime.lastTelegramTransportChange.at}）`);
     console.log(`最近 Telegram 通信：${runtime.lastTelegramSuccessAt || '尚无'}`);
     console.log(`最近 Codex 刷新：${runtime.lastCodexSuccessAt || '尚无'}`);
     if (runtime.lastCodexRequestReceived) {

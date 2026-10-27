@@ -9,7 +9,7 @@ import { join, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 
-for (const outage of [false, true]) test(`real bridge ${outage ? 'recovers a failed approval notification after a Telegram outage' : 'forwards an MCP card'} and submits each decision only once`, { timeout: 15000 }, async t => {
+for (const outage of [false, true, 'fallback']) test(`real bridge ${outage === 'fallback' ? 'switches to an independent transport after repeated polling failures' : outage ? 'recovers a failed approval notification after a Telegram outage' : 'forwards an MCP card'} and submits each decision only once`, { timeout: 15000 }, async t => {
   const root = await mkdtemp(join(tmpdir(), 'cf-flow-'));
   const socketPath = join(root, 'rpc.sock');
   const server = createServer();
@@ -25,6 +25,7 @@ for (const outage of [false, true]) test(`real bridge ${outage ? 'recovers a fai
   let failedCard = false;
   let pollCount = 0;
   t.after(async () => {
+    if (t.signal.aborted) t.diagnostic(JSON.stringify({ calls: calls.map(x => [x.method, x.transport]), stdout, stderr }));
     if (child && !exited) {
       const stopped = once(child, 'exit');
       child.kill('SIGTERM');
@@ -42,6 +43,7 @@ for (const outage of [false, true]) test(`real bridge ${outage ? 'recovers a fai
     }
   }
   await cp(new URL('../src/', import.meta.url), join(root, 'src'), { recursive: true });
+  await writeFile(join(root, 'src', 'telegram-curl.mjs'), `export const curlFetch = (url, options) => fetch(url, { ...options, headers: { ...options.headers, 'x-test-transport': 'curl' } });`);
   await symlink(fileURLToPath(new URL('../node_modules', import.meta.url)), join(root, 'node_modules'), 'dir');
   await mkdir(join(root, '.local'));
   await mkdir(join(root, 'bin'));
@@ -60,7 +62,7 @@ for (const outage of [false, true]) test(`real bridge ${outage ? 'recovers a fai
     globalThis.fetch = async (url, options) => new Promise(resolve => {
       const id = ++next;
       pending.set(id, resolve);
-      process.send({ id, method: new URL(url).pathname.split('/').at(-1), data: JSON.parse(options.body) });
+      process.send({ id, method: new URL(url).pathname.split('/').at(-1), data: JSON.parse(options.body), transport: options.headers['x-test-transport'] || 'fetch' });
     });
   `);
   websocket.on('connection', socket => {
@@ -109,9 +111,14 @@ for (const outage of [false, true]) test(`real bridge ${outage ? 'recovers a fai
     if (request.method === 'getUpdates') {
       pollCount++;
       if (outage && pollCount <= 2) {
-        child.send({ id: request.id, payload: pollCount === 1
+        child.send({ id: request.id, payload: pollCount === 1 || outage === 'fallback'
           ? { ok: false, error_code: 502, description: 'Bad Gateway' }
           : { ok: true, result: [] } });
+        activity.emit('change');
+        return;
+      }
+      if (outage === 'fallback' && pollCount === 3) {
+        child.send({ id: request.id, payload: { ok: true, result: [] } });
         activity.emit('change');
         return;
       }
@@ -119,6 +126,7 @@ for (const outage of [false, true]) test(`real bridge ${outage ? 'recovers a fai
       activity.emit('change');
       return;
     }
+    if (request.method === 'answerCallbackQuery' && outage === 'fallback') return; // A hung acknowledgement must not block a live approval.
     if (request.method === 'sendMessage') result = { ...request.data, message_id: calls.length };
     const payload = request.method === 'answerCallbackQuery'
       ? { ok: false, error_code: 400, description: 'query is too old and response timeout expired' }
@@ -141,6 +149,10 @@ for (const outage of [false, true]) test(`real bridge ${outage ? 'recovers a fai
   assert.equal(responses.length, 0, 'sending a card must not approve it');
   const runtime = JSON.parse(await readFile(join(root, '.local', 'runtime.json'), 'utf8'));
   assert.equal(runtime.lastRequestDeliveredToTelegram.interactive, true);
+  if (outage === 'fallback') {
+    assert.equal(runtime.telegramTransport, 'curl');
+    assert.ok(calls.some(x => x.method === 'getUpdates' && x.transport === 'curl'));
+  }
   const click = { update_id: 1, callback_query: { id: 'click-1', from: { id: 34 }, data: session.callback_data,
     message: { message_id: 99, chat: { id: 12, type: 'private' } } } };
   child.send({ id: polls.shift().id, payload: { ok: true, result: [click] } });

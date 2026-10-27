@@ -25,7 +25,7 @@ function updateRuntime(values) {
   renameSync(path + '.tmp', path);
 }
 const logError = error => {
-  const message = redact(error?.message || error, token);
+  const message = redact(`${error?.method ? `Telegram ${error.method} [${error.transport}]：` : ''}${error?.message || error}`, token);
   console.error(`${new Date().toISOString()} ${message}`);
   try { updateRuntime({ lastError: { message, at: new Date().toISOString() } }); } catch {}
 };
@@ -37,11 +37,17 @@ if (!token) {
   process.exit(1);
 }
 
-const telegram = new Telegram(token);
+const telegram = new Telegram(token, fetch, {
+  onTransport(change) {
+    const at = new Date().toISOString();
+    updateRuntime({ telegramTransport: change.transport, lastTelegramTransportChange: { ...change, at } });
+    console.log(`${at} Telegram 连接通道切换 ${JSON.stringify(change)}`);
+  },
+});
 const state = new State(join(project, '.local'));
 runtime = {
   pid: process.pid, startedAt: new Date().toISOString(), status: 'starting',
-  codexConnected: false, telegramConnected: false, loadedTasks: 0,
+  codexConnected: false, telegramConnected: false, telegramTransport: 'fetch', loadedTasks: 0,
   lastCodexSuccessAt: null, lastTelegramSuccessAt: null, lastError: null,
 };
 const addresses = new Addresses(state.data.addresses);
@@ -282,7 +288,7 @@ async function handle(update) {
   }
   if (callback) {
     // A delayed Telegram UI acknowledgement must not discard a still-live approval.
-    await telegram.call('answerCallbackQuery', { callback_query_id: callback.id }).catch(logError);
+    telegram.call('answerCallbackQuery', { callback_query_id: callback.id }).catch(logError);
     await refresh();
     const [kind, key, value, option] = (callback.data || '').split(':');
     if (kind === 'open') {
@@ -393,7 +399,7 @@ async function main() {
   try {
     while (running) {
       try {
-        const updates = await telegram.call('getUpdates', { offset: state.data.offset, timeout: 30, allowed_updates: ['message', 'callback_query'] });
+        const updates = await telegram.call('getUpdates', { offset: state.data.offset, timeout: 10, allowed_updates: ['message', 'callback_query'] });
         updateRuntime({ telegramConnected: true, lastTelegramSuccessAt: new Date().toISOString() });
         failures = 0;
         for (const update of updates) {
