@@ -13,6 +13,7 @@ function display(status) {
   if (status.running && runtime) {
     console.log(`Codex 连接：${runtime.codexConnected ? '已连接' : '未连接'}；当前会话：${runtime.loadedTasks || 0}`);
     if (runtime.lastTerminalScanAt) console.log(`最近 /tasks 检测：${runtime.terminalTasks} 个终端会话（${runtime.lastTerminalScanAt}）`);
+    if (runtime.lastTaskListDelivered) console.log(`Telegram 最近已接收会话列表：消息 ${runtime.lastTaskListDelivered.messageId}（${runtime.lastTaskListDelivered.at}）`);
     console.log(`Telegram 连接：${runtime.telegramConnected ? '已连接' : '未连接'}`);
     console.log(`Telegram 通道：${runtime.telegramTransport === 'curl' ? 'curl 独立连接兜底' : 'Node fetch'}`);
     if (runtime.clashGuard) console.log(`Clash 自动巡检：${runtime.clashGuard.status}；节点：${runtime.clashGuard.node || '未知'}（${runtime.clashGuard.at}）`);

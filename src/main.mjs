@@ -13,6 +13,7 @@ import { mcpToolApproval, mcpApprovalResult } from './mcp-approval.mjs';
 import { RequestNotifications } from './request-notifications.mjs';
 import { createClashWatch } from './clash-watch.mjs';
 import { terminalThreads } from './terminal-sessions.mjs';
+import { TaskListReply } from './task-list-reply.mjs';
 import { authorized, matchingCode, parsePairCommand, title, statusText, PendingRequests, approvalResult } from './core.mjs';
 
 const project = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -111,7 +112,17 @@ async function refreshThreads() {
   }
 }
 
-async function listFriends() {
+const taskListReply = new TaskListReply(state, {
+  render: renderFriends,
+  delivered(message) {
+    const delivery = { messageId: message.message_id, at: new Date().toISOString() };
+    updateRuntime({ lastTaskListDelivered: delivery });
+    console.log(`${delivery.at} Telegram 已接收会话列表 ${JSON.stringify(delivery)}`);
+  },
+});
+const listFriends = () => taskListReply.request();
+
+async function renderFriends() {
   await refresh();
   const snapshot = await terminalThreads(rpc, threads.values());
   updateRuntime({ terminalTasks: snapshot.threads.length, terminalProcesses: snapshot.processes,
@@ -119,15 +130,17 @@ async function listFriends() {
   const all = snapshot.threads.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
   if (!all.length) return tell('没有检测到终端中打开的 Codex 会话。请在 VS Code Terminal 或 iTerm2 中打开会话后重新 /tasks。' +
     (snapshot.unconfirmed ? '\n部分会话的终端状态暂时无法确认，请稍后重试。' : ''));
+  let message;
   for (let i = 0; i < all.length; i += 12) {
     const page = all.slice(i, i + 12);
-    await tell('终端中打开的会话：\n\n' + page.map(thread => `${addresses.display(thread.id)} · ${statusText(thread.status)}\n${title(thread)}`).join('\n\n') + '\n\n用 @名字 消息 直接与会话对话，例如 @c1 继续。' +
+    message = await tell('终端中打开的会话：\n\n' + page.map(thread => `${addresses.display(thread.id)} · ${statusText(thread.status)}\n${title(thread)}`).join('\n\n') + '\n\n用 @名字 消息 直接与会话对话，例如 @c1 继续。' +
       (snapshot.unconfirmed ? '\n部分会话的终端状态暂时无法确认，已隐藏，可稍后重试 /tasks。' : ''), {
       reply_markup: { inline_keyboard: page.map(thread => [{
         text: `${addresses.display(thread.id)} ${title(thread).slice(0, 24)}`, callback_data: `open:${thread.id}`,
       }]) },
     });
   }
+  return message;
 }
 
 async function recent(id) {
@@ -401,6 +414,7 @@ async function main() {
   const timer = setInterval(() => {
     refresh().catch(logError);
     notifications.retry().catch(logError);
+    taskListReply.retry().catch(logError);
   }, 15000);
   let failures = 0;
   try {
@@ -417,6 +431,7 @@ async function main() {
           catch (error) { logError(error); await tell(redact(error.message, token)).catch(logError); }
         }
         notifications.retry().catch(logError);
+        taskListReply.retry().catch(logError);
       } catch (error) {
         updateRuntime({ telegramConnected: false });
         logError(error);

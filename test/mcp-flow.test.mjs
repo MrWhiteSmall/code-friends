@@ -23,6 +23,7 @@ for (const outage of [false, true, 'fallback']) test(`real bridge ${outage === '
   let stderr = '';
   let stdout = '';
   let failedCard = false;
+  let failedList = false;
   let pollCount = 0;
   t.after(async () => {
     if (t.signal.aborted) t.diagnostic(JSON.stringify({ calls: calls.map(x => [x.method, x.transport]), stdout, stderr }));
@@ -115,6 +116,12 @@ for (const outage of [false, true, 'fallback']) test(`real bridge ${outage === '
       activity.emit('change');
       return;
     }
+    if (request.method === 'sendMessage' && outage && !failedList && request.data.text.startsWith('终端中打开的会话：')) {
+      failedList = true;
+      child.send({ id: request.id, payload: { ok: false, error_code: 502, description: 'Bad Gateway' } });
+      activity.emit('change');
+      return;
+    }
     if (request.method === 'getUpdates') {
       pollCount++;
       if (outage && pollCount <= 2) {
@@ -178,4 +185,15 @@ for (const outage of [false, true, 'fallback']) test(`real bridge ${outage === '
   assert.match(list.data.text, /等待新指令/);
   assert.ok(!list.data.text.includes('Closed fixture'));
   assert.equal(list.data.reply_markup.inline_keyboard.flat().length, 1);
+  if (outage) {
+    await until(() => polls.length);
+    await new Promise(resolve => setTimeout(resolve, 2100));
+    child.send({ id: polls.shift().id, payload: { ok: true, result: [] } });
+  }
+  await until(() => stdout.includes('Telegram 已接收会话列表'));
+  assert.equal(calls.filter(x => x.method === 'sendMessage' && x.data.text.startsWith('终端中打开的会话：')).length, outage ? 2 : 1);
+  const deliveredRuntime = JSON.parse(await readFile(join(root, '.local', 'runtime.json'), 'utf8'));
+  assert.ok(deliveredRuntime.lastTaskListDelivered.messageId);
+  const saved = JSON.parse(await readFile(join(root, '.local', 'state.json'), 'utf8'));
+  assert.equal(saved.tasksReplyPending, false);
 });
