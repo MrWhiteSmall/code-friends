@@ -43,6 +43,9 @@ for (const outage of [false, true, 'fallback']) test(`real bridge ${outage === '
     }
   }
   await cp(new URL('../src/', import.meta.url), join(root, 'src'), { recursive: true });
+  await cp(join(root, 'src', 'terminal-sessions.mjs'), join(root, 'src', 'terminal-sessions-original.mjs'));
+  await writeFile(join(root, 'src', 'terminal-sessions.mjs'), `import { terminalThreads as real } from './terminal-sessions-original.mjs';
+    export const terminalThreads = (rpc, threads) => real(rpc, threads, async () => ({ ports: new Set([5555]), processes: 1 }));`);
   await writeFile(join(root, 'src', 'telegram-curl.mjs'), `export const curlFetch = (url, options) => fetch(url, { ...options, headers: { ...options.headers, 'x-test-transport': 'curl' } });`);
   await symlink(fileURLToPath(new URL('../node_modules', import.meta.url)), join(root, 'node_modules'), 'dir');
   await mkdir(join(root, '.local'));
@@ -70,9 +73,13 @@ for (const outage of [false, true, 'fallback']) test(`real bridge ${outage === '
       const message = JSON.parse(bytes.toString());
       const reply = result => socket.send(JSON.stringify({ id: message.id, result }));
       if (message.method === 'initialize') reply({});
-      if (message.method === 'thread/loaded/list') reply({ data: ['task-a'] });
-      if (message.method === 'thread/read') reply({ thread: { id: 'task-a', name: 'MCP fixture', status: { type: 'active' } } });
+      if (message.method === 'thread/loaded/list') reply({ data: ['task-a', 'closed-task'] });
+      if (message.method === 'thread/read') reply({ thread: { id: message.params.threadId,
+        name: message.params.threadId === 'task-a' ? 'MCP fixture' : 'Closed fixture', status: { type: 'idle' } } });
+      if (message.method === 'mcpServerStatus/list') reply({ data: message.params.threadId === 'task-a'
+        ? [{ name: 'codex_tui', httpOrigin: 'http://127.0.0.1:5555' }] : [] });
       if (message.method === 'thread/resume') {
+        if (message.params.threadId !== 'task-a') return reply({});
         socket.send(JSON.stringify({ id: 'approval-1', method: 'mcpServer/elicitation/request', params: {
           threadId: 'task-a', turnId: 'turn-a', serverName: 'cua_repl', mode: 'form',
           message: 'Allow the cua_repl MCP server to run tool "js"?',
@@ -162,4 +169,13 @@ for (const outage of [false, true, 'fallback']) test(`real bridge ${outage === '
   child.send({ id: polls.shift().id, payload: { ok: true, result: [{ ...click, update_id: 2 }] } });
   await until(() => calls.some(x => x.method === 'sendMessage' && x.data.text.includes('此请求已经处理或过期')));
   assert.equal(responses.length, 1, 'a duplicate click must not submit the decision again');
+  await until(() => polls.length);
+  child.send({ id: polls.shift().id, payload: { ok: true, result: [{ update_id: 3,
+    message: { from: { id: 34 }, chat: { id: 12, type: 'private' }, text: '/tasks' } }] } });
+  await until(() => calls.some(x => x.method === 'sendMessage' && x.data.text.startsWith('终端中打开的会话：')));
+  const list = calls.find(x => x.method === 'sendMessage' && x.data.text.startsWith('终端中打开的会话：'));
+  assert.match(list.data.text, /MCP fixture/);
+  assert.match(list.data.text, /等待新指令/);
+  assert.ok(!list.data.text.includes('Closed fixture'));
+  assert.equal(list.data.reply_markup.inline_keyboard.flat().length, 1);
 });
