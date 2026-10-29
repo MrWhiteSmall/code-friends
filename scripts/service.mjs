@@ -12,6 +12,8 @@ function display(status) {
   console.log(`手机配对：${status.paired ? '已配对' : '未配对'}`);
   if (status.running && runtime) {
     console.log(`Codex 连接：${runtime.codexConnected ? '已连接' : '未连接'}；当前会话：${runtime.loadedTasks || 0}`);
+    console.log(`自动允许会话：${runtime.autoAllowTasks?.join('、') || '无'}`);
+    if (runtime.lastAutoApproval) console.log(`最近自动允许：${runtime.lastAutoApproval.task} ${runtime.lastAutoApproval.method}（${runtime.lastAutoApproval.at}）；本次运行共 ${runtime.autoApprovals} 次`);
     if (runtime.lastTerminalScanAt) console.log(`最近 /tasks 检测：${runtime.terminalTasks} 个终端会话（${runtime.lastTerminalScanAt}）`);
     if (runtime.lastTaskListDelivered) console.log(`Telegram 最近已接收会话列表：消息 ${runtime.lastTaskListDelivered.messageId}（${runtime.lastTaskListDelivered.at}）`);
     console.log(`Telegram 连接：${runtime.telegramConnected ? '已连接' : '未连接'}`);

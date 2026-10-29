@@ -14,6 +14,7 @@ import { RequestNotifications } from './request-notifications.mjs';
 import { createClashWatch } from './clash-watch.mjs';
 import { terminalThreads } from './terminal-sessions.mjs';
 import { TaskListReply } from './task-list-reply.mjs';
+import { AutoAllow } from './auto-allow.mjs';
 import { authorized, matchingCode, parsePairCommand, title, statusText, PendingRequests, approvalResult } from './core.mjs';
 
 const project = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -55,6 +56,14 @@ runtime = {
 };
 const addresses = new Addresses(state.data.addresses);
 const pending = new PendingRequests();
+const autoAllow = new AutoAllow(state, pending, {
+  respond: (id, result) => rpc.respond(id, result),
+  approved(request) {
+    const record = { task: addresses.display(request.params.threadId), method: request.method, at: new Date().toISOString() };
+    updateRuntime({ lastAutoApproval: record, autoApprovals: (runtime.autoApprovals || 0) + 1 });
+    console.log(`${record.at} 已自动允许 ${JSON.stringify(record)}`);
+  },
+});
 const threads = new Map();
 const watching = new Set();
 const attempts = new Map();
@@ -133,7 +142,7 @@ async function renderFriends() {
   let message;
   for (let i = 0; i < all.length; i += 12) {
     const page = all.slice(i, i + 12);
-    message = await tell('终端中打开的会话：\n\n' + page.map(thread => `${addresses.display(thread.id)} · ${statusText(thread.status)}\n${title(thread)}`).join('\n\n') + '\n\n用 @名字 消息 直接与会话对话，例如 @c1 继续。' +
+    message = await tell('终端中打开的会话：\n\n' + page.map(thread => `${addresses.display(thread.id)} · ${statusText(thread.status)}${autoAllow.enabled(thread.id) ? ' · 自动允许' : ''}\n${title(thread)}`).join('\n\n') + '\n\n用 @名字 消息 直接与会话对话，例如 @c1 继续。' +
       (snapshot.unconfirmed ? '\n部分会话的终端状态暂时无法确认，已隐藏，可稍后重试 /tasks。' : ''), {
       reply_markup: { inline_keyboard: page.map(thread => [{
         text: `${addresses.display(thread.id)} ${title(thread).slice(0, 24)}`, callback_data: `open:${thread.id}`,
@@ -149,7 +158,32 @@ async function recent(id) {
   const messages = (turn?.items || []).filter(item => ['agentMessage', 'userMessage'].includes(item.type));
   const content = messages.slice(-4).map(item => item.type === 'agentMessage'
     ? `Codex：${item.text}` : `你：${(item.content || []).map(x => x.text || '').join('')}`).join('\n\n');
-  await tell(`好友：${friend(id)}\n${statusText(threads.get(id)?.status)}\n\n${content || '暂无最近对话。'}\n\n直接发送文字与这个任务对话，也可回复它的通知。`, undefined, { threadId: id });
+  await tell(`好友：${friend(id)}\n${statusText(threads.get(id)?.status)}\n自动允许：${autoAllow.enabled(id) ? '已开启' : '已关闭'}\n\n${content || '暂无最近对话。'}\n\n直接发送文字与这个任务对话，也可回复它的通知。`, autoAllowControls(id), { threadId: id });
+}
+
+function autoAllowControls(id) {
+  const enabled = autoAllow.enabled(id);
+  return { reply_markup: { inline_keyboard: [[{
+    text: enabled ? '关闭此会话自动允许' : '开启此会话自动允许（含当前审批）',
+    callback_data: `auto:${id}:${enabled ? 'off' : 'on'}`,
+  }]] } };
+}
+
+async function setAutoAllow(id, enabled) {
+  if (enabled) {
+    await refresh();
+    if (!threads.has(id)) throw new Error('这个会话当前未连接，请 /tasks 选择。');
+  }
+  autoAllow.set(id, enabled);
+  updateRuntime({ autoAllowTasks: autoAllow.enabledIds().map(id => addresses.display(id)) });
+  if (enabled) {
+    for (const [key, entry] of pending.entries) {
+      if (entry.request.params.threadId === id) autoAllow.apply(key);
+    }
+  }
+  return tell(`「${friend(id)}」自动允许已${enabled ? '开启' : '关闭'}。\n` + (enabled
+    ? '当前及后续的命令、文件、权限和 MCP 工具审批会自动允许。问题、登录和表单仍需你处理。\n设置仅绑定此会话，桥接重启后保留；可随时用下方按钮关闭。'
+    : '后续新审批恢复手动确认，已提交的批准不会撤销。'), autoAllowControls(id));
 }
 
 async function sendInput(id, text, inputId) {
@@ -173,7 +207,9 @@ const notifications = new RequestNotifications(pending, {
     updateRuntime({ lastRequestDeliveryError: { task, method: request.method, message: redact(error.message, token), at: new Date().toISOString() } });
   },
 });
-const showRequest = (key, options) => notifications.show(key, options);
+async function showRequest(key, options) {
+  if (!autoAllow.apply(key)) return notifications.show(key, options);
+}
 
 async function renderRequest(key, current) {
   const entry = pending.entries.get(key);
@@ -309,8 +345,12 @@ async function handle(update) {
   if (callback) {
     // A delayed Telegram UI acknowledgement must not discard a still-live approval.
     telegram.call('answerCallbackQuery', { callback_query_id: callback.id }).catch(logError);
-    await refresh();
     const [kind, key, value, option] = (callback.data || '').split(':');
+    if (kind === 'auto') {
+      if (!Object.hasOwn(state.data.addresses, key) || !['on', 'off'].includes(value)) throw new Error('无效的自动允许开关。');
+      return setAutoAllow(key, value === 'on');
+    }
+    await refresh();
     if (kind === 'open') {
       if (!threads.has(key)) throw new Error('任务已断开，请重新 /tasks。');
       state.data.selected = key; state.save();
@@ -344,6 +384,19 @@ async function handle(update) {
   if (!text) return;
   const command = text.match(/^\/([a-z]+)(?:@\w+)?(?:\s|$)/)?.[1];
   if (command === 'tasks') return listFriends();
+  if (command === 'autoallow') {
+    const parts = text.trim().split(/\s+/).slice(1);
+    if (!parts.length) {
+      const ids = autoAllow.enabledIds();
+      return tell('已开启自动允许的会话：\n' + (ids.map(id => friend(id)).join('\n') || '（无）') +
+        '\n\n/autoallow c1 on — 开启，含当前等待的审批\n/autoallow c1 off — 关闭\n/autoallow c1 — 查看状态\n仅绑定指定会话，桥接重启后保留。');
+    }
+    if (parts.length > 2 || (parts[1] && !['on', 'off'].includes(parts[1]))) throw new Error('用法：/autoallow c1 on 或 /autoallow c1 off');
+    const id = addresses.find(parts[0]);
+    if (!id) throw new Error('找不到这个会话，请 /tasks 查看名字。');
+    if (!parts[1]) return tell(`「${friend(id)}」自动允许：${autoAllow.enabled(id) ? '已开启' : '已关闭'}。`, autoAllowControls(id));
+    return setAutoAllow(id, parts[1] === 'on');
+  }
   if (command === 'pending') {
     await refresh();
     if (!pending.entries.size) return tell('当前连接没有等待中的请求。');
@@ -460,12 +513,14 @@ if (!checking) {
 }
 process.on('exit', () => { if (locked) { try { unlinkSync(lockPath); } catch {} } });
 if (!checking) updateRuntime({ status: 'starting' });
+updateRuntime({ autoAllowTasks: autoAllow.enabledIds().map(id => addresses.display(id)) });
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => {
   updateRuntime({ status: 'stopped', codexConnected: false, telegramConnected: false });
   pending.clear(); rpc.close(); process.exit(0);
 });
 rpc.on('disconnect', error => {
   pending.clear();
+  autoAllow.disconnected();
   watching.clear();
   threads.clear();
   updateRuntime({ codexConnected: false, loadedTasks: 0 });

@@ -9,7 +9,7 @@ import { join, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 
-for (const outage of [false, true, 'fallback']) test(`real bridge ${outage === 'fallback' ? 'switches to an independent transport after repeated polling failures' : outage ? 'recovers a failed approval notification after a Telegram outage' : 'forwards an MCP card'} and submits each decision only once`, { timeout: 15000 }, async t => {
+for (const outage of [false, true, 'fallback', 'restored']) test(`real bridge ${outage === 'restored' ? 'restores per-session auto allow on startup' : outage === 'fallback' ? 'switches to an independent transport after repeated polling failures' : outage ? 'recovers a failed approval notification after a Telegram outage' : 'forwards an MCP card'} and submits each decision only once`, { timeout: 15000 }, async t => {
   const root = await mkdtemp(join(tmpdir(), 'cf-flow-'));
   const socketPath = join(root, 'rpc.sock');
   const server = createServer();
@@ -18,6 +18,7 @@ for (const outage of [false, true, 'fallback']) test(`real bridge ${outage === '
   const calls = [];
   const polls = [];
   const responses = [];
+  let codexSocket;
   let child;
   let exited = false;
   let stderr = '';
@@ -52,7 +53,8 @@ for (const outage of [false, true, 'fallback']) test(`real bridge ${outage === '
   await mkdir(join(root, '.local'));
   await mkdir(join(root, 'bin'));
   await writeFile(join(root, '.local', 'state.json'), JSON.stringify({ owner: { userId: 34, chatId: 12 },
-    addresses: { 'task-a': { code: 'c1' } }, replies: {}, offset: 0 }));
+    addresses: { 'task-a': { code: 'c1' } }, replies: {}, offset: 0,
+    autoAllowThreads: outage === 'restored' ? { 'task-a': true } : {} }));
   await writeFile(join(root, 'bin', 'codex'), `#!${process.execPath}\nconsole.log(${JSON.stringify(JSON.stringify({ status: 'running', socketPath }))});\n`, { mode: 0o700 });
   await writeFile(join(root, 'fake-telegram.mjs'), `
     let next = 0;
@@ -70,6 +72,7 @@ for (const outage of [false, true, 'fallback']) test(`real bridge ${outage === '
     });
   `);
   websocket.on('connection', socket => {
+    codexSocket = socket;
     socket.on('message', bytes => {
       const message = JSON.parse(bytes.toString());
       const reply = result => socket.send(JSON.stringify({ id: message.id, result }));
@@ -79,6 +82,7 @@ for (const outage of [false, true, 'fallback']) test(`real bridge ${outage === '
         name: message.params.threadId === 'task-a' ? 'MCP fixture' : 'Closed fixture', status: { type: 'idle' } } });
       if (message.method === 'mcpServerStatus/list') reply({ data: message.params.threadId === 'task-a'
         ? [{ name: 'codex_tui', httpOrigin: 'http://127.0.0.1:5555' }] : [] });
+      if (message.method === 'thread/turns/list') reply({ data: [] });
       if (message.method === 'thread/resume') {
         if (message.params.threadId !== 'task-a') return reply({});
         socket.send(JSON.stringify({ id: 'approval-1', method: 'mcpServer/elicitation/request', params: {
@@ -90,7 +94,7 @@ for (const outage of [false, true, 'fallback']) test(`real bridge ${outage === '
         } }));
         reply({});
       }
-      if (!message.method && message.id === 'approval-1') {
+      if (!message.method && message.id !== undefined) {
         responses.push(message);
         activity.emit('change');
       }
@@ -148,6 +152,15 @@ for (const outage of [false, true, 'fallback']) test(`real bridge ${outage === '
     child.send({ id: request.id, payload });
     activity.emit('change');
   });
+  if (outage === 'restored') {
+    await until(() => polls.length && responses.length);
+    assert.deepEqual(responses, [{ id: 'approval-1', result: { action: 'accept', content: {}, _meta: null } }]);
+    assert.equal(calls.some(x => x.method === 'sendMessage' && x.data.text.includes('等待 MCP 工具授权')), false);
+    const runtime = JSON.parse(await readFile(join(root, '.local', 'runtime.json'), 'utf8'));
+    assert.deepEqual(runtime.autoAllowTasks, ['@c1']);
+    assert.equal(runtime.autoApprovals, 1);
+    return;
+  }
   await until(() => polls.length && stdout.includes('Telegram 已接收交互请求卡片'));
   const cards = calls.filter(x => x.method === 'sendMessage' && x.data.text.includes('等待 MCP 工具授权'));
   assert.equal(cards.length, outage ? 2 : 1);
@@ -196,4 +209,62 @@ for (const outage of [false, true, 'fallback']) test(`real bridge ${outage === '
   assert.ok(deliveredRuntime.lastTaskListDelivered.messageId);
   const saved = JSON.parse(await readFile(join(root, '.local', 'state.json'), 'utf8'));
   assert.equal(saved.tasksReplyPending, false);
+  if (!outage) {
+    let updateId = 3;
+    const textUpdate = text => ({ update_id: ++updateId,
+      message: { from: { id: 34 }, chat: { id: 12, type: 'private' }, text } });
+    async function sendUpdate(update) {
+      await until(() => polls.length);
+      child.send({ id: polls.shift().id, payload: { ok: true, result: [update] } });
+      await until(() => polls.length);
+    }
+    // An unrelated Telegram user cannot turn automation on.
+    const unauthorized = textUpdate('/autoallow c1 on');
+    unauthorized.message.from.id = 99;
+    await sendUpdate(unauthorized);
+    assert.equal(JSON.parse(await readFile(join(root, '.local', 'state.json'), 'utf8')).autoAllowThreads['task-a'], undefined);
+    // Queue a current approval, then enable from the session detail button.
+    const approval = { id: 'auto-command', method: 'item/commandExecution/requestApproval',
+      params: { threadId: 'task-a', command: 'pwd', availableDecisions: ['accept', 'decline'] } };
+    codexSocket.send(JSON.stringify(approval));
+    await until(() => calls.some(x => x.method === 'sendMessage' && x.data.text.includes('等待你的批准')));
+    await sendUpdate({ update_id: ++updateId, callback_query: { id: 'open-task', from: { id: 34 },
+      data: 'open:task-a', message: { message_id: 100, chat: { id: 12, type: 'private' } } } });
+    const detail = calls.find(x => x.method === 'sendMessage' && x.data.text.includes('自动允许：已关闭'));
+    assert.ok(detail);
+    const enableButton = detail.data.reply_markup.inline_keyboard.flat()[0];
+    await sendUpdate({ update_id: ++updateId, callback_query: { id: 'enable-auto', from: { id: 34 },
+      data: enableButton.callback_data, message: { message_id: 101, chat: { id: 12, type: 'private' } } } });
+    assert.deepEqual(responses.find(x => x.id === 'auto-command').result, { decision: 'accept' });
+    // New approvals proceed without sending a card, even when Telegram is not polled.
+    const sendCount = calls.filter(x => x.method === 'sendMessage').length;
+    const next = { ...approval, id: 'auto-next' };
+    codexSocket.send(JSON.stringify(next));
+    await until(() => responses.some(x => x.id === 'auto-next'));
+    codexSocket.send(JSON.stringify(next));
+    // A separate session remains manual; waiting for its card flushes the replay.
+    codexSocket.send(JSON.stringify({ ...approval, id: 'other-thread', params: { ...approval.params, threadId: 'closed-task' } }));
+    await until(() => calls.filter(x => x.method === 'sendMessage').length > sendCount);
+    assert.equal(responses.filter(x => x.id === 'auto-next').length, 1);
+    assert.equal(responses.some(x => x.id === 'other-thread'), false);
+    const toolApproval = { id: 'auto-mcp', method: 'mcpServer/elicitation/request', params: {
+      threadId: 'task-a', serverName: 'cua_repl', mode: 'form', requestedSchema: { type: 'object', properties: {} },
+      _meta: { codex_approval_kind: 'mcp_tool_call', persist: ['session', 'always'] },
+    } };
+    codexSocket.send(JSON.stringify(toolApproval));
+    await until(() => responses.some(x => x.id === 'auto-mcp'));
+    assert.deepEqual(responses.find(x => x.id === 'auto-mcp').result, { action: 'accept', content: {}, _meta: null });
+    codexSocket.send(JSON.stringify({ id: 'human-question', method: 'item/tool/requestUserInput', params: {
+      threadId: 'task-a', questions: [{ id: 'q1', question: 'Human choice required', options: [] }],
+    } }));
+    await until(() => calls.some(x => x.method === 'sendMessage' && x.data.text.includes('Human choice required')));
+    assert.equal(responses.some(x => x.id === 'human-question'), false);
+    await sendUpdate(textUpdate('/autoallow'));
+    assert.ok(calls.some(x => x.method === 'sendMessage' && x.data.text.startsWith('已开启自动允许的会话：\n@c1')));
+    await sendUpdate(textUpdate('/autoallow c1 off'));
+    codexSocket.send(JSON.stringify({ ...approval, id: 'manual-after-off', params: { ...approval.params, command: 'echo manual-after-off' } }));
+    await until(() => calls.some(x => x.method === 'sendMessage' && x.data.text.includes('echo manual-after-off')));
+    assert.equal(responses.some(x => x.id === 'manual-after-off'), false);
+    assert.equal(JSON.parse(await readFile(join(root, '.local', 'state.json'), 'utf8')).autoAllowThreads['task-a'], undefined);
+  }
 });
