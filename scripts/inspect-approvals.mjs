@@ -1,6 +1,6 @@
 import { readFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { CodexRPC } from '../src/rpc.mjs';
-import { loadThreadSnapshot, missingThread } from '../src/threads.mjs';
+import { loadThreadSnapshot, missingThread, threadOwners } from '../src/threads.mjs';
 import { Addresses } from '../src/addresses.mjs';
 import { redact } from '../src/telegram.mjs';
 import { mcpToolApproval } from '../src/mcp-approval.mjs';
@@ -11,11 +11,14 @@ const addresses = new Addresses(state.addresses);
 const rpc = new CodexRPC();
 const requests = new Map();
 const errors = [];
+let owners = new Map();
+const subagents = new Map();
 rpc.on('disconnect', error => errors.push(redact(error.message)));
 rpc.on('request', request => {
   const p = request.params || {};
   requests.set(`${p.threadId}:${request.id}`, {
-    task: addresses.display(p.threadId), threadId: p.threadId, method: request.method,
+    task: addresses.display(owners.get(p.threadId) || p.threadId), threadId: p.threadId,
+    rootThreadId: owners.get(p.threadId), subtask: subagents.get(p.threadId)?.agentNickname, method: request.method,
     parameterNames: Object.keys(p), availableDecisions: p.availableDecisions,
     permissionKeys: p.permissions ? Object.keys(p.permissions) : undefined,
     serverName: p.serverName, mode: p.mode,
@@ -27,12 +30,16 @@ rpc.on('request', request => {
 rpc.on('notification', ({ method, params: p }) => {
   if (method === 'serverRequest/resolved') requests.delete(`${p.threadId}:${p.requestId}`);
 });
-const report = { capturedAt: new Date().toISOString(), tasks: [], pending: [], errors };
+const report = { capturedAt: new Date().toISOString(), tasks: [], subtasks: [], pending: [], errors };
 try {
   await rpc.connect();
   const snapshot = await loadThreadSnapshot(rpc);
-  for (const thread of snapshot.threads) {
-    report.tasks.push({ task: addresses.display(thread.id), id: thread.id, name: thread.name,
+  owners = threadOwners(snapshot.threads, snapshot.subagents);
+  for (const thread of snapshot.subagents) if (owners.has(thread.id)) subagents.set(thread.id, thread);
+  for (const thread of [...snapshot.threads, ...subagents.values()]) {
+    const list = subagents.has(thread.id) ? report.subtasks : report.tasks;
+    list.push({ task: addresses.display(owners.get(thread.id)), id: thread.id, name: thread.name,
+      parentThreadId: thread.parentThreadId, rootThreadId: owners.get(thread.id), agentNickname: thread.agentNickname,
       cwd: thread.cwd, path: thread.path, source: thread.source, status: thread.status,
       fields: Object.keys(thread) });
     try { await rpc.call('thread/resume', { threadId: thread.id, excludeTurns: true }); }

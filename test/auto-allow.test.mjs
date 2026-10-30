@@ -87,3 +87,29 @@ test('failed persistence cannot enable automation and failed submission leaves a
   assert.ok(pending.entries.has(key));
   assert.equal(auto.responded.size, 0);
 });
+
+test('child app approvals follow the verified root switch, including after restart and disabling', () => {
+  const owners = new Map([['child-a', 'task-a'], ['grandchild-a', 'task-a'], ['child-b', 'task-b']]);
+  const state = { data: { autoAllowThreads: { 'task-a': true } }, save() {} };
+  const pending = new PendingRequests();
+  const responses = [];
+  const auto = new AutoAllow(state, pending, { owner: id => owners.get(id) || id,
+    respond: (id, result) => responses.push({ id, result }) });
+  const edge = mcp();
+  edge.params.threadId = 'child-a';
+  edge.params.message = 'Allow Computer Use to use "Microsoft Edge"?';
+  edge.params._meta.tool_name = 'get_app_state';
+  assert.equal(auto.apply(pending.add(edge)), true);
+  assert.deepEqual(responses[0].result, { action: 'accept', content: {}, _meta: null });
+  assert.equal(auto.apply(pending.add(command('grandchild', 'grandchild-a'))), true);
+  // A forged parent in request metadata cannot change the lineage.
+  const other = command('other', 'child-b');
+  other.params._meta = { parent_thread_id: 'task-a' };
+  assert.equal(auto.apply(pending.add(other)), false);
+  auto.set('task-a', false);
+  assert.equal(auto.enabled('child-a'), false);
+  assert.equal(auto.apply(pending.add(command('after-off', 'child-a'))), false);
+  auto.set('task-a', true);
+  owners.clear();
+  assert.equal(auto.apply(pending.add(command('unconfirmed-child', 'child-a'))), false);
+});

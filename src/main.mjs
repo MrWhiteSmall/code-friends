@@ -8,7 +8,7 @@ import { State } from './state.mjs';
 import { Addresses } from './addresses.mjs';
 import { BOT_COMMANDS, registerCommands } from './commands.mjs';
 import { deliverInput, deliveryDescription } from './delivery.mjs';
-import { loadThreadSnapshot, missingThread } from './threads.mjs';
+import { loadThreadSnapshot, missingThread, threadOwners } from './threads.mjs';
 import { mcpToolApproval, mcpApprovalResult } from './mcp-approval.mjs';
 import { RequestNotifications } from './request-notifications.mjs';
 import { createClashWatch } from './clash-watch.mjs';
@@ -56,10 +56,15 @@ runtime = {
 };
 const addresses = new Addresses(state.data.addresses);
 const pending = new PendingRequests();
+let owners = new Map();
+const subagents = new Map();
+const rootThread = id => owners.get(id) || id;
 const autoAllow = new AutoAllow(state, pending, {
+  owner: rootThread,
   respond: (id, result) => rpc.respond(id, result),
   approved(request) {
-    const record = { task: addresses.display(request.params.threadId), method: request.method, at: new Date().toISOString() };
+    const record = { task: taskAddress(request.params.threadId), requestId: request.id, threadId: request.params.threadId,
+      rootThreadId: rootThread(request.params.threadId), method: request.method, at: new Date().toISOString() };
     updateRuntime({ lastAutoApproval: record, autoApprovals: (runtime.autoApprovals || 0) + 1 });
     console.log(`${record.at} 已自动允许 ${JSON.stringify(record)}`);
   },
@@ -75,13 +80,30 @@ let refreshing;
 async function tell(text, extra, target, current) {
   if (!state.data.owner) return;
   const message = await telegram.send(state.data.owner.chatId, text, extra, current);
-  if (target && message) state.reply(message.message_id, target);
+  if (target && message) state.reply(message.message_id, { ...target, threadId: rootThread(target.threadId) });
   return message;
 }
 
 function friend(id) {
-  const thread = threads.get(id);
-  return thread ? `${addresses.display(id)} · ${title(thread)}` : (addresses.display(id) || id);
+  const thread = threads.get(rootThread(id));
+  return thread ? `${taskAddress(id)} · ${title(thread)}` : taskAddress(id);
+}
+
+function taskAddress(id) {
+  const address = addresses.display(rootThread(id)) || id;
+  const child = subagents.get(id);
+  return child ? `${address} / 子任务 ${child.agentNickname || child.source?.subAgent?.thread_spawn?.agent_nickname || id}` : address;
+}
+
+function friendStatus(thread) {
+  if (!thread) return statusText();
+  const activeFlags = new Set(thread.status?.activeFlags || []);
+  for (const child of subagents.values()) {
+    if (rootThread(child.id) === thread.id) {
+      for (const flag of child.status?.activeFlags || []) activeFlags.add(flag);
+    }
+  }
+  return statusText({ ...thread.status, activeFlags: [...activeFlags] });
 }
 
 function refresh() {
@@ -93,6 +115,9 @@ async function refreshThreads() {
   try {
     await rpc.connect();
     const snapshot = await loadThreadSnapshot(rpc);
+    owners = threadOwners(snapshot.threads, snapshot.subagents);
+    subagents.clear();
+    for (const thread of snapshot.subagents) if (owners.has(thread.id)) subagents.set(thread.id, thread);
     const ids = new Set();
     let skippedTasks = snapshot.missingIds.length;
     for (const thread of snapshot.threads) {
@@ -100,21 +125,32 @@ async function refreshThreads() {
       ids.add(id);
       threads.set(id, thread);
       if (addresses.ensure(id)) state.save();
+    }
+    for (const id of threads.keys()) if (!ids.has(id)) threads.delete(id);
+    for (const thread of [...snapshot.threads, ...subagents.values()]) {
+      const id = thread.id;
+      if (!threads.has(rootThread(id))) continue;
+      ids.add(id);
       if (!checking && state.data.owner && !watching.has(id)) {
         watching.add(id); // Pending requests may replay before resume's response.
         try { await rpc.call('thread/resume', { threadId: id, excludeTurns: true }); }
         catch (error) {
           watching.delete(id);
-          if (missingThread(error)) { ids.delete(id); skippedTasks++; }
+          if (missingThread(error)) { ids.delete(id); threads.delete(id); skippedTasks++; }
           else { logError(error); if (!rpc.connected) throw error; }
         }
       }
     }
-    for (const id of threads.keys()) {
-      if (!ids.has(id)) { threads.delete(id); watching.delete(id); pending.removeThread(id); }
+    for (const id of watching) {
+      if (!ids.has(id) || !threads.has(rootThread(id))) { watching.delete(id); pending.removeThread(id); }
+    }
+    for (const id of subagents.keys()) {
+      if (!ids.has(id) || !threads.has(rootThread(id))) { subagents.delete(id); owners.delete(id); }
     }
     if (!rpc.connected) throw new Error('Codex 后台连接已断开，正在等待自动重连。');
-    updateRuntime({ codexConnected: true, loadedTasks: threads.size, skippedTasks, lastCodexSuccessAt: new Date().toISOString() });
+    updateRuntime({ codexConnected: true, loadedTasks: threads.size, loadedSubtasks: subagents.size,
+      waitingSubtasks: [...subagents.values()].filter(t => t.status?.activeFlags?.includes('waitingOnApproval')).map(t => taskAddress(t.id)),
+      skippedTasks, lastCodexSuccessAt: new Date().toISOString() });
   } catch (error) {
     updateRuntime({ codexConnected: rpc.connected });
     throw error;
@@ -142,7 +178,7 @@ async function renderFriends() {
   let message;
   for (let i = 0; i < all.length; i += 12) {
     const page = all.slice(i, i + 12);
-    message = await tell('终端中打开的会话：\n\n' + page.map(thread => `${addresses.display(thread.id)} · ${statusText(thread.status)}${autoAllow.enabled(thread.id) ? ' · 自动允许' : ''}\n${title(thread)}`).join('\n\n') + '\n\n用 @名字 消息 直接与会话对话，例如 @c1 继续。' +
+    message = await tell('终端中打开的会话：\n\n' + page.map(thread => `${addresses.display(thread.id)} · ${friendStatus(thread)}${autoAllow.enabled(thread.id) ? ' · 自动允许（含子任务）' : ''}\n${title(thread)}`).join('\n\n') + '\n\n用 @名字 消息 直接与会话对话，例如 @c1 继续。' +
       (snapshot.unconfirmed ? '\n部分会话的终端状态暂时无法确认，已隐藏，可稍后重试 /tasks。' : ''), {
       reply_markup: { inline_keyboard: page.map(thread => [{
         text: `${addresses.display(thread.id)} ${title(thread).slice(0, 24)}`, callback_data: `open:${thread.id}`,
@@ -158,13 +194,13 @@ async function recent(id) {
   const messages = (turn?.items || []).filter(item => ['agentMessage', 'userMessage'].includes(item.type));
   const content = messages.slice(-4).map(item => item.type === 'agentMessage'
     ? `Codex：${item.text}` : `你：${(item.content || []).map(x => x.text || '').join('')}`).join('\n\n');
-  await tell(`好友：${friend(id)}\n${statusText(threads.get(id)?.status)}\n自动允许：${autoAllow.enabled(id) ? '已开启' : '已关闭'}\n\n${content || '暂无最近对话。'}\n\n直接发送文字与这个任务对话，也可回复它的通知。`, autoAllowControls(id), { threadId: id });
+  await tell(`好友：${friend(id)}\n${friendStatus(threads.get(id))}\n自动允许：${autoAllow.enabled(id) ? '已开启（含子任务）' : '已关闭'}\n\n${content || '暂无最近对话。'}\n\n直接发送文字与这个任务对话，也可回复它的通知。`, autoAllowControls(id), { threadId: id });
 }
 
 function autoAllowControls(id) {
   const enabled = autoAllow.enabled(id);
   return { reply_markup: { inline_keyboard: [[{
-    text: enabled ? '关闭此会话自动允许' : '开启此会话自动允许（含当前审批）',
+    text: enabled ? '关闭此会话及子任务自动允许' : '开启自动允许（含子任务和当前审批）',
     callback_data: `auto:${id}:${enabled ? 'off' : 'on'}`,
   }]] } };
 }
@@ -178,11 +214,11 @@ async function setAutoAllow(id, enabled) {
   updateRuntime({ autoAllowTasks: autoAllow.enabledIds().map(id => addresses.display(id)) });
   if (enabled) {
     for (const [key, entry] of pending.entries) {
-      if (entry.request.params.threadId === id) autoAllow.apply(key);
+      if (rootThread(entry.request.params.threadId) === id) autoAllow.apply(key);
     }
   }
   return tell(`「${friend(id)}」自动允许已${enabled ? '开启' : '关闭'}。\n` + (enabled
-    ? '当前及后续的命令、文件、权限和 MCP 工具审批会自动允许。问题、登录和表单仍需你处理。\n设置仅绑定此会话，桥接重启后保留；可随时用下方按钮关闭。'
+    ? '此会话及其子任务当前和后续的命令、文件、权限和 MCP 工具审批会自动允许。问题、登录和表单仍需你处理。\n设置绑定此主会话，桥接重启后保留；可随时用下方按钮关闭。'
     : '后续新审批恢复手动确认，已提交的批准不会撤销。'), autoAllowControls(id));
 }
 
@@ -196,14 +232,14 @@ const notifications = new RequestNotifications(pending, {
   render: renderRequest,
   logError,
   delivered(request, message) {
-    const task = addresses.display(request.params.threadId) || request.params.threadId;
+    const task = taskAddress(request.params.threadId);
     const interactive = Boolean(message.reply_markup?.inline_keyboard?.some(row => row.some(button => button.callback_data)));
     const delivery = { task, method: request.method, messageId: message.message_id, interactive, at: new Date().toISOString() };
     updateRuntime({ lastRequestDeliveredToTelegram: delivery });
     console.log(`${delivery.at} Telegram 已接收${interactive ? '交互请求卡片' : '请求通知'} ${JSON.stringify(delivery)}`);
   },
   failed(request, error) {
-    const task = addresses.display(request.params.threadId) || request.params.threadId;
+    const task = taskAddress(request.params.threadId);
     updateRuntime({ lastRequestDeliveryError: { task, method: request.method, message: redact(error.message, token), at: new Date().toISOString() } });
   },
 });
@@ -276,7 +312,8 @@ async function answerQuestion(key, answer, questionIndex) {
 rpc.on('request', request => {
   if (!watching.has(request.params?.threadId)) return;
   const key = pending.add(request);
-  const received = { task: addresses.display(request.params.threadId) || request.params.threadId, method: request.method, at: new Date().toISOString() };
+  const received = { task: taskAddress(request.params.threadId), requestId: request.id, threadId: request.params.threadId,
+    rootThreadId: rootThread(request.params.threadId), method: request.method, at: new Date().toISOString() };
   updateRuntime({ lastCodexRequestReceived: received });
   console.log(`${received.at} 收到 Codex 请求 ${JSON.stringify(received)}`);
   showRequest(key).catch(logError);
@@ -286,6 +323,8 @@ rpc.on('notification', notification => {
   if (method === 'serverRequest/resolved') pending.resolved(p.threadId, p.requestId);
   if (!watching.has(p?.threadId)) return;
   if (method === 'thread/status/changed' && threads.has(p.threadId)) threads.get(p.threadId).status = p.status;
+  if (method === 'thread/status/changed' && subagents.has(p.threadId)) subagents.get(p.threadId).status = p.status;
+  if (subagents.has(p.threadId)) return; // Only approvals/questions are forwarded for child tasks.
   if (method === 'turn/completed') {
     const answer = (p.turn.items || []).filter(x => x.type === 'agentMessage').at(-1)?.text;
     tell(`好友：${friend(p.threadId)}\n本轮${p.turn.status === 'completed' ? '已完成' : p.turn.status}。\n\n${answer || p.turn.error?.message || '可打开任务查看最近对话。'}`, undefined, { threadId: p.threadId }).catch(logError);
@@ -389,7 +428,7 @@ async function handle(update) {
     if (!parts.length) {
       const ids = autoAllow.enabledIds();
       return tell('已开启自动允许的会话：\n' + (ids.map(id => friend(id)).join('\n') || '（无）') +
-        '\n\n/autoallow c1 on — 开启，含当前等待的审批\n/autoallow c1 off — 关闭\n/autoallow c1 — 查看状态\n仅绑定指定会话，桥接重启后保留。');
+        '\n\n/autoallow c1 on — 开启，含子任务和当前等待的审批\n/autoallow c1 off — 关闭\n/autoallow c1 — 查看状态\n绑定指定主会话及其子任务，桥接重启后保留。');
     }
     if (parts.length > 2 || (parts[1] && !['on', 'off'].includes(parts[1]))) throw new Error('用法：/autoallow c1 on 或 /autoallow c1 off');
     const id = addresses.find(parts[0]);
@@ -521,6 +560,8 @@ for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => {
 rpc.on('disconnect', error => {
   pending.clear();
   autoAllow.disconnected();
+  owners.clear();
+  subagents.clear();
   watching.clear();
   threads.clear();
   updateRuntime({ codexConnected: false, loadedTasks: 0 });

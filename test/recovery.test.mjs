@@ -8,7 +8,7 @@ import { once } from 'node:events';
 import { WebSocketServer } from 'ws';
 import { CodexRPC } from '../src/rpc.mjs';
 import { Telegram } from '../src/telegram.mjs';
-import { loadThreadSnapshot } from '../src/threads.mjs';
+import { loadThreadSnapshot, threadOwners } from '../src/threads.mjs';
 
 test('read-only timeout errors are redacted without overwriting their message', async () => {
   const token = 'fake-private-token';
@@ -31,7 +31,7 @@ test('Telegram API errors preserve fatal codes and rate-limit delays', async () 
   }
 });
 
-test('snapshot skips stale sessions and subagents while reading subsequent pages', async () => {
+test('snapshot separates roots and subagents and skips stale sessions across pages', async () => {
   const reads = [];
   const rpc = { async call(method, params) {
     if (method === 'thread/loaded/list') return params.cursor
@@ -42,8 +42,29 @@ test('snapshot skips stale sessions and subagents while reading subsequent pages
   } };
   const snapshot = await loadThreadSnapshot(rpc);
   assert.deepEqual(snapshot.threads.map(x => x.id), ['first', 'last']);
+  assert.deepEqual(snapshot.subagents.map(x => x.id), ['child']);
   assert.deepEqual(snapshot.missingIds, ['stale']);
   assert.deepEqual(reads, ['stale', 'first', 'child', 'last']);
+});
+
+test('lineage assigns descendants to the correct root without inheriting across forks, orphans or cycles', () => {
+  const roots = [{ id: 'root-a' }, { id: 'root-b', forkedFromId: 'root-a' }];
+  const children = [
+    { id: 'grandchild', parentThreadId: 'child-a' },
+    { id: 'child-b', parentThreadId: 'root-b' },
+    { id: 'child-a', parentThreadId: 'root-a' },
+    { id: 'legacy-child', source: { subAgent: { thread_spawn: { parent_thread_id: 'root-a' } } } },
+    { id: 'orphan', parentThreadId: 'missing' },
+    { id: 'loop-a', parentThreadId: 'loop-b' }, { id: 'loop-b', parentThreadId: 'loop-a' },
+    { id: 'conflicting', parentThreadId: 'root-b', source: { subAgent: { thread_spawn: { parent_thread_id: 'root-a' } } } },
+  ];
+  const owners = threadOwners(roots, children);
+  assert.equal(owners.get('root-b'), 'root-b');
+  assert.equal(owners.get('child-a'), 'root-a');
+  assert.equal(owners.get('grandchild'), 'root-a');
+  assert.equal(owners.get('legacy-child'), 'root-a');
+  assert.equal(owners.get('child-b'), 'root-b');
+  for (const id of ['orphan', 'loop-a', 'loop-b', 'conflicting']) assert.equal(owners.has(id), false);
 });
 
 test('snapshot propagates transport failure instead of claiming a healthy empty list', async () => {

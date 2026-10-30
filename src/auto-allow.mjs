@@ -14,12 +14,12 @@ export function automaticApproval(request) {
 }
 
 export class AutoAllow {
-  constructor(state, pending, { respond, approved = () => {} }) {
-    Object.assign(this, { state, pending, respond, approved });
+  constructor(state, pending, { respond, approved = () => {}, owner = id => id }) {
+    Object.assign(this, { state, pending, respond, approved, owner });
     this.state.data.autoAllowThreads ||= {};
     this.responded = new Set();
   }
-  enabled(threadId) { return this.state.data.autoAllowThreads[threadId] === true; }
+  enabled(threadId) { return this.state.data.autoAllowThreads[this.owner(threadId)] === true; }
   enabledIds() { return Object.keys(this.state.data.autoAllowThreads).filter(id => this.enabled(id)); }
   set(threadId, enabled) {
     const previous = { ...this.state.data.autoAllowThreads };
